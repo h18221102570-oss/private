@@ -1,4 +1,13 @@
+import { getToken } from '../store/db';
+
 const API = '/api';
+
+function authHeaders() {
+  return {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer ' + getToken(),
+  };
+}
 
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'system';
@@ -6,14 +15,14 @@ export interface ChatMessage {
 }
 
 export async function getAIConfig(): Promise<{ hasKey: boolean; keyPreview: string }> {
-  const res = await fetch(`${API}/ai/config`);
+  const res = await fetch(`${API}/ai/config`, { headers: authHeaders() });
   return res.json();
 }
 
 export async function setAIConfig(apiKey: string): Promise<void> {
   await fetch(`${API}/ai/config`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders(),
     body: JSON.stringify({ apiKey }),
   });
 }
@@ -21,7 +30,7 @@ export async function setAIConfig(apiKey: string): Promise<void> {
 export async function aiChat(messages: ChatMessage[], projectContext?: string): Promise<string> {
   const res = await fetch(`${API}/ai/chat`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders(),
     body: JSON.stringify({ messages, projectContext }),
   });
   if (!res.ok) {
@@ -33,7 +42,7 @@ export async function aiChat(messages: ChatMessage[], projectContext?: string): 
 }
 
 export async function aiSearch(keyword: string): Promise<any[]> {
-  const res = await fetch(`${API}/ai/search?q=${encodeURIComponent(keyword)}`);
+  const res = await fetch(`${API}/ai/search?q=${encodeURIComponent(keyword)}`, { headers: authHeaders() });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: '搜索失败' }));
     throw new Error(err.error || '搜索失败');
@@ -49,7 +58,7 @@ export async function aiAnalyzeDoc(docName: string, docContent: string, docType:
 }> {
   const res = await fetch(`${API}/ai/analyze-doc`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders(),
     body: JSON.stringify({ docName, docContent, docType }),
   });
   if (!res.ok) {
@@ -80,7 +89,7 @@ export async function classifyFiles(files: {
 }[]): Promise<FileClassification[]> {
   const res = await fetch(`${API}/files/classify`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders(),
     body: JSON.stringify({ files }),
   });
   if (!res.ok) {
@@ -100,7 +109,7 @@ export async function batchUploadFiles(projectId: string, files: {
 }[]): Promise<{ success: boolean; count: number; documents: any[] }> {
   const res = await fetch(`${API}/files/batch-upload`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders(),
     body: JSON.stringify({ projectId, files }),
   });
   if (!res.ok) {
