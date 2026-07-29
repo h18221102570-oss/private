@@ -17,6 +17,7 @@ import DocEditor from './components/DocEditor'
 import UniverSheet from './components/UniverSheet'
 import DocumentCreator from './components/DocumentCreator'
 import SmartFileOrganizer from './components/SmartFileOrganizer'
+import OcrPanel from './components/OcrPanel'
 import AdminManager from './components/AdminManager'
 
 function SplashScreen({ onDone }: { onDone: () => void }) {
@@ -121,6 +122,7 @@ export default function App() {
             <Route path="/sheet-editor" element={<UniverSheet />} />
             <Route path="/doc-creator" element={<DocumentCreator />} />
             <Route path="/file-organizer" element={<SmartFileOrganizer />} />
+            <Route path="/ocr" element={<OcrPanel />} />
             <Route path="/ai" element={<AIChat />} />
             <Route path="/trash" element={<RecycleBin />} />
             <Route path="/admin-accounts" element={<AdminManager />} />

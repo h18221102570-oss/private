@@ -714,6 +714,84 @@ app.post('/api/ai/analyze-doc', requireAuth, checkAIRate, async (req, res) => {
   }
 });
 
+// ========== OCR 文字识别 ==========
+
+const SCRIPTS_DIR = path.join(__dirname, 'scripts');
+
+function runPythonScript(scriptName, ...args) {
+  return new Promise((resolve, reject) => {
+    const { spawn } = require('child_process');
+    const pyExe = process.platform === 'win32' ? 'python' : 'python3';
+    const proc = spawn(pyExe, [path.join(SCRIPTS_DIR, scriptName), ...args], {
+      maxBuffer: 50 * 1024 * 1024, // 50MB buffer
+    });
+    let stdout = '', stderr = '';
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('close', (code) => {
+      if (code !== 0) return reject(new Error(stderr || 'OCR 执行失败'));
+      try {
+        resolve(JSON.parse(stdout));
+      } catch {
+        reject(new Error('OCR 结果解析失败'));
+      }
+    });
+    proc.on('error', (err) => reject(err));
+  });
+}
+
+// OCR 识别接口
+app.post('/api/ocr/recognize', requireAuth, async (req, res) => {
+  try {
+    const { filePath } = req.body;
+    if (!filePath) return res.status(400).json({ message: '请提供文件路径' });
+
+    const fullPath = path.join(FILES_DIR, path.basename(filePath));
+    if (!fs.existsSync(fullPath)) return res.status(404).json({ message: '文件不存在' });
+
+    const result = await runPythonScript('ocr.py', fullPath, '--lang', 'ch');
+    res.json(result);
+  } catch (e) {
+    safeError(res, e, 'OCR 识别失败');
+  }
+});
+
+// AI 信息提取接口
+app.post('/api/ocr/extract', requireAuth, checkAIRate, async (req, res) => {
+  try {
+    const { text, prompt } = req.body;
+    if (!text) return res.status(400).json({ message: '请提供待提取的文本' });
+
+    const userPrompt = prompt || '请提取以下文本中的工程关键信息（项目名称、工程部位、材料规格、强度等级、施工日期等），以 JSON 格式返回，字段名用英文。';
+
+    const messages = [
+      { role: 'system', content: '你是一个专业的工程资料结构化提取助手。请严格按照用户要求的格式提取信息，只返回提取结果，不要添加额外说明。' },
+      { role: 'user', content: `${userPrompt}\n\n待提取文本：\n${text.slice(0, 15000)}` },
+    ];
+
+    const aiRes = await callDeepSeek(messages);
+    const data = await aiRes.json();
+    const content = data.choices[0].message.content;
+
+    // 尝试解析 JSON
+    let extracted = null;
+    const jsonMatch = content.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+    if (jsonMatch) {
+      try {
+        extracted = JSON.parse(jsonMatch[0]);
+      } catch {
+        extracted = { raw: content };
+      }
+    } else {
+      extracted = { raw: content };
+    }
+
+    res.json({ success: true, extracted, rawContent: content });
+  } catch (e) {
+    safeError(res, e, 'AI 提取失败');
+  }
+});
+
 // ========== 智能文件收纳 ==========
 
 app.post('/api/files/classify', requireAuth, checkAIRate, async (req, res) => {

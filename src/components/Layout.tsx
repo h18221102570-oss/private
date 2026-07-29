@@ -135,6 +135,7 @@ export default function Layout() {
     { to: '/inspection', label: '材料检测', icon: '🧪' },
     { to: '/file-organizer', label: '智能收纳', icon: '🗂️' },
     { to: '/doc-creator', label: '资料编制', icon: '📝' },
+    { to: '/ocr', label: 'OCR 识别', icon: '👁️' },
     { to: '/ai', label: 'AI 助手', icon: '🤖' },
     { to: '/documents', label: '文档中心', icon: '📄' },
   ]
