@@ -4,18 +4,25 @@ import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
+import {
+  initDB, saveDB,
+  getAdminByUsername, getAdminById, getAdmins, createAdmin, updateAdminPassword, deleteAdmin,
+  getProjects, getProjectById, createProject, updateProject, deleteProject,
+  getDocuments, getDocumentById, getDocumentWithFileData, createDocument, softDeleteDocument, restoreDocument, permanentDeleteDocument,
+  getDeletedDocuments, emptyTrash, searchDocuments, getDocumentsByProject, getDocumentsByPhase,
+  getTasks, getTaskById, createTask, updateTask, deleteTask,
+  getMembers, getMemberById, createMember, updateMember, deleteMember,
+  getDashboardStats,
+} from './server-db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3001;
 const DATA_DIR = path.join(__dirname, 'data');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
-const DB_FILE = path.join(DATA_DIR, 'database.json');
-const DB_TMP = path.join(DATA_DIR, 'database.tmp');
 const FILES_DIR = path.join(DATA_DIR, 'files');
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
-const MAX_BACKUPS = 10;
 
 // ========== Helpers ==========
 
@@ -40,99 +47,22 @@ function getDeepSeekKey() {
   return process.env.DEEPSEEK_API_KEY || loadConfig().deepseekApiKey || '';
 }
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-}
-if (!fs.existsSync(FILES_DIR)) {
-  fs.mkdirSync(FILES_DIR, { recursive: true });
-}
-if (!fs.existsSync(BACKUP_DIR)) {
-  fs.mkdirSync(BACKUP_DIR, { recursive: true });
-}
+// ========== 初始化 ==========
 
-// ========== JSON Database ==========
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(FILES_DIR)) fs.mkdirSync(FILES_DIR, { recursive: true });
+if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
 
-let db = { projects: [], documents: [], tasks: [], members: [], admins: [] };
-
-function loadDB() {
-  try {
-    if (fs.existsSync(DB_FILE)) {
-      db = { ...db, ...JSON.parse(fs.readFileSync(DB_FILE, 'utf-8')) };
-    }
-  } catch (e) {
-    console.error('Failed to load database, starting fresh:', e.message);
-  }
-  // 迁移旧数据
-  if (db.credentials || !db.admins || !Array.isArray(db.admins) || db.admins.length === 0) {
-    if (db.credentials) {
-      db.admins = [{
-        id: crypto.randomUUID(),
-        username: db.credentials.username || '黄康杰',
-        password: hashPassword(db.credentials.password || '123456789'),
-        role: 'super_admin',
-        createdAt: new Date().toISOString(),
-      }];
-    } else {
-      db.admins = [{
-        id: crypto.randomUUID(),
-        username: '黄康杰',
-        password: hashPassword('123456789'),
-        role: 'super_admin',
-        createdAt: new Date().toISOString(),
-      }];
-    }
-    delete db.credentials;
-    saveDB();
-  }
-  // 自动哈希化未加密的密码（SHA-256 哈希值为 64 字符）
-  let needSave = false;
-  for (const admin of db.admins) {
-    if (admin.password && admin.password.length !== 64) {
-      admin.password = hashPassword(admin.password);
-      needSave = true;
-    }
-  }
-  if (needSave) saveDB();
-}
-
-function saveDB() {
-  try {
-    // 原子写入：先写临时文件，再重命名
-    fs.writeFileSync(DB_TMP, JSON.stringify(db, null, 2), 'utf-8');
-    fs.renameSync(DB_TMP, DB_FILE);
-    // 自动备份
-    autoBackup();
-  } catch (e) {
-    console.error('Failed to save database:', e.message);
-  }
-}
-
-function autoBackup() {
-  try {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const backupFile = path.join(BACKUP_DIR, `backup-${timestamp}.json`);
-    fs.copyFileSync(DB_FILE, backupFile);
-    // 清理旧备份
-    const backups = fs.readdirSync(BACKUP_DIR)
-      .filter((f) => f.startsWith('backup-'))
-      .sort()
-      .reverse();
-    for (let i = MAX_BACKUPS; i < backups.length; i++) {
-      fs.unlinkSync(path.join(BACKUP_DIR, backups[i]));
-    }
-  } catch (e) { /* ignore */ }
-}
-
-loadDB();
+// 初始化 SQLite 数据库
+await initDB();
 
 // ========== Auth Tokens ==========
 
-const tokens = new Map(); // token -> { adminId, role, createdAt }
+const tokens = new Map();
 
 function generateToken(adminId) {
   const token = crypto.randomBytes(32).toString('hex');
   tokens.set(token, { adminId, createdAt: Date.now() });
-  // 24小时过期
   setTimeout(() => tokens.delete(token), 24 * 60 * 60 * 1000);
   return token;
 }
@@ -149,17 +79,15 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// ========== 生产模式：托管前端静态文件 ==========
+// 生产模式：托管前端静态文件
 const DIST_DIR = path.join(__dirname, 'dist');
 if (fs.existsSync(DIST_DIR)) {
   app.use(express.static(DIST_DIR));
-  // SPA fallback：所有非 API 请求返回 index.html
   app.get(/^\/(?!api\/).*/, (_req, res) => {
     res.sendFile(path.join(DIST_DIR, 'index.html'));
   });
 }
 
-// 鉴权中间件
 function requireAuth(req, res, next) {
   const auth = getAuth(req);
   if (!auth) return res.status(401).json({ message: '请先登录' });
@@ -167,11 +95,10 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// 超级管理员鉴权
-function requireSuperAdmin(req, res, next) {
+async function requireSuperAdmin(req, res, next) {
   const auth = getAuth(req);
   if (!auth) return res.status(401).json({ message: '请先登录' });
-  const admin = db.admins.find((a) => a.id === auth.adminId);
+  const admin = getAdminById(auth.adminId);
   if (!admin || admin.role !== 'super_admin') {
     return res.status(403).json({ message: '仅超级管理员可操作' });
   }
@@ -179,7 +106,6 @@ function requireSuperAdmin(req, res, next) {
   next();
 }
 
-// AI 速率限制（每分钟最多20次）
 const aiRateLimit = new Map();
 function checkAIRate(req, res, next) {
   const auth = getAuth(req);
@@ -195,13 +121,11 @@ function checkAIRate(req, res, next) {
   next();
 }
 
-// 安全错误处理
 function safeError(res, e, fallback = '操作失败') {
   console.error(e.message);
   res.status(500).json({ message: fallback });
 }
 
-// 白名单字段过滤
 function pick(obj, keys) {
   const result = {};
   for (const k of keys) {
@@ -212,27 +136,18 @@ function pick(obj, keys) {
 
 function mimeToExt(mimeType) {
   const map = {
-    'application/pdf': '.pdf',
-    'application/msword': '.doc',
+    'application/pdf': '.pdf', 'application/msword': '.doc',
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
     'application/vnd.ms-excel': '.xls',
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
     'application/vnd.ms-powerpoint': '.ppt',
     'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
-    'image/png': '.png',
-    'image/jpeg': '.jpg',
-    'image/gif': '.gif',
-    'image/svg+xml': '.svg',
-    'image/webp': '.webp',
-    'text/plain': '.txt',
-    'text/csv': '.csv',
-    'application/zip': '.zip',
-    'application/x-rar-compressed': '.rar',
-    'application/x-7z-compressed': '.7z',
-    'application/json': '.json',
-    'video/mp4': '.mp4',
-    'application/dwg': '.dwg',
-    'application/x-autocad': '.dwg',
+    'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif',
+    'image/svg+xml': '.svg', 'image/webp': '.webp',
+    'text/plain': '.txt', 'text/csv': '.csv',
+    'application/zip': '.zip', 'application/x-rar-compressed': '.rar',
+    'application/x-7z-compressed': '.7z', 'application/json': '.json',
+    'video/mp4': '.mp4', 'application/dwg': '.dwg', 'application/x-autocad': '.dwg',
   };
   return map[mimeType] || '';
 }
@@ -242,8 +157,8 @@ function mimeToExt(mimeType) {
 app.post('/api/auth/login', (req, res) => {
   const { username, password } = req.body;
   const hashed = hashPassword(String(password || ''));
-  const admin = db.admins.find((a) => a.username === username && a.password === hashed);
-  if (admin) {
+  const admin = getAdminByUsername(username);
+  if (admin && admin.password === hashed) {
     const token = generateToken(admin.id);
     res.json({ success: true, token, role: admin.role, username: admin.username, adminId: admin.id });
   } else {
@@ -260,68 +175,58 @@ app.post('/api/auth/logout', requireAuth, (req, res) => {
 
 app.post('/api/auth/change-password', requireAuth, (req, res) => {
   const { oldPassword, newPassword } = req.body;
-  const admin = db.admins.find((a) => a.id === req.auth.adminId);
+  const admin = getAdminById(req.auth.adminId);
   if (!admin) return res.status(404).json({ message: '账号不存在' });
   if (oldPassword && hashPassword(oldPassword) !== admin.password) {
     return res.status(400).json({ message: '原密码错误' });
   }
-  admin.password = hashPassword(String(newPassword || ''));
-  saveDB();
+  updateAdminPassword(req.auth.adminId, hashPassword(String(newPassword || '')));
   res.json({ success: true });
 });
 
 app.post('/api/auth/reset-password', requireSuperAdmin, (req, res) => {
   const { adminId, newPassword } = req.body;
-  const admin = db.admins.find((a) => a.id === adminId);
+  const admin = getAdminById(adminId);
   if (!admin) return res.status(404).json({ message: '账号不存在' });
-  admin.password = hashPassword(String(newPassword || ''));
-  saveDB();
+  updateAdminPassword(adminId, hashPassword(String(newPassword || '')));
   res.json({ success: true });
 });
 
 // ========== Admin Management ==========
 
 app.get('/api/admins', requireAuth, (_req, res) => {
-  res.json(db.admins.map((a) => ({ id: a.id, username: a.username, role: a.role, createdAt: a.createdAt })));
+  res.json(getAdmins());
 });
 
 app.post('/api/admins', requireSuperAdmin, (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ message: '用户名和密码不能为空' });
-  if (db.admins.find((a) => a.username === username)) {
+  if (getAdminByUsername(username)) {
     return res.status(400).json({ message: '用户名已存在' });
   }
-  const admin = {
-    id: crypto.randomUUID(),
-    username: String(username),
-    password: hashPassword(String(password)),
-    role: 'admin',
-    createdAt: new Date().toISOString(),
-  };
-  db.admins.push(admin);
-  saveDB();
-  res.status(201).json({ id: admin.id, username: admin.username, role: admin.role, createdAt: admin.createdAt });
+  const id = crypto.randomUUID();
+  createAdmin(id, String(username), hashPassword(String(password)), 'admin');
+  res.status(201).json({ id, username: String(username), role: 'admin', createdAt: new Date().toISOString() });
 });
 
 app.delete('/api/admins/:id', requireSuperAdmin, (req, res) => {
-  const admin = db.admins.find((a) => a.id === req.params.id);
+  const admin = getAdminById(req.params.id);
   if (!admin) return res.status(404).json({ message: '账号不存在' });
   if (admin.role === 'super_admin') return res.status(403).json({ message: '不能删除超级管理员' });
-  db.admins = db.admins.filter((a) => a.id !== req.params.id);
-  saveDB();
+  deleteAdmin(req.params.id);
   res.json({ success: true });
 });
 
 // ========== Projects API ==========
 
-const PROJECT_FIELDS = ['name', 'description', 'status', 'currentPhase', 'location', 'manager', 'budget', 'startDate', 'endDate', 'developer', 'contractor', 'designUnit', 'supervisor', 'projectType', 'buildingArea', 'structureType', 'floorCount', 'memberIds'];
+const PROJECT_FIELDS = ['name','description','status','currentPhase','location','manager','budget','startDate','endDate','developer','contractor','designUnit','supervisor','projectType','buildingArea','structureType','floorCount','memberIds'];
 
 app.get('/api/projects', requireAuth, (_req, res) => {
-  res.json(db.projects);
+  res.json(getProjects());
 });
 
 app.get('/api/projects/:id', requireAuth, (req, res) => {
-  const p = db.projects.find((p) => p.id === req.params.id);
+  const p = getProjectById(req.params.id);
   if (!p) return res.status(404).json({ message: '项目未找到' });
   res.json(p);
 });
@@ -333,31 +238,21 @@ app.post('/api/projects', requireAuth, (req, res) => {
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
-  db.projects.push(project);
-  saveDB();
+  createProject(project);
   res.status(201).json(project);
 });
 
 app.put('/api/projects/:id', requireAuth, (req, res) => {
-  const idx = db.projects.findIndex((p) => p.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ message: '项目未找到' });
-  db.projects[idx] = { ...db.projects[idx], ...pick(req.body, PROJECT_FIELDS), id: req.params.id, updatedAt: new Date().toISOString() };
-  saveDB();
-  res.json(db.projects[idx]);
+  const p = getProjectById(req.params.id);
+  if (!p) return res.status(404).json({ message: '项目未找到' });
+  updateProject(req.params.id, { ...pick(req.body, PROJECT_FIELDS), updatedAt: new Date().toISOString() });
+  res.json({ ...p, ...pick(req.body, PROJECT_FIELDS) });
 });
 
 app.delete('/api/projects/:id', requireAuth, (req, res) => {
-  const idx = db.projects.findIndex((p) => p.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ message: '项目未找到' });
-  db.projects.splice(idx, 1);
-  const now = new Date().toISOString();
-  for (const doc of db.documents) {
-    if (doc.projectId === req.params.id) {
-      doc.deleted = true;
-      doc.deletedAt = now;
-    }
-  }
-  saveDB();
+  const p = getProjectById(req.params.id);
+  if (!p) return res.status(404).json({ message: '项目未找到' });
+  deleteProject(req.params.id);
   res.json({ success: true });
 });
 
@@ -365,121 +260,160 @@ app.delete('/api/projects/:id', requireAuth, (req, res) => {
 
 app.get('/api/documents', requireAuth, (req, res) => {
   const { projectId, phase } = req.query;
-  let docs = db.documents.filter((d) => !d.deleted);
-  if (projectId) docs = docs.filter((d) => d.projectId === projectId);
-  if (phase) docs = docs.filter((d) => d.phase === phase);
-  res.json(docs);
+  const filter = {};
+  if (projectId) filter.projectId = projectId;
+  if (phase) filter.phase = phase;
+  res.json(getDocuments(filter));
 });
 
 app.post('/api/documents', requireAuth, (req, res) => {
   const docId = crypto.randomUUID();
   let filePath = '';
-  
+  let fileDataBuffer = null;
+
   if (req.body.fileData) {
     const safeExt = mimeToExt(req.body.fileType) || '.bin';
     const fileName = `${docId}${safeExt}`;
-    filePath = path.join(FILES_DIR, fileName);
+    filePath = `files/${fileName}`;
+    const fullPath = path.join(FILES_DIR, fileName);
     try {
-      const buffer = Buffer.from(req.body.fileData, 'base64');
-      fs.writeFileSync(filePath, buffer);
+      fileDataBuffer = Buffer.from(req.body.fileData, 'base64');
+      // 同时保存到文件系统（用于 mammoth 等需要文件路径的操作）
+      fs.writeFileSync(fullPath, fileDataBuffer);
     } catch (e) {
       return safeError(res, e, '文件保存失败');
     }
   }
-  
+
   const doc = {
     id: docId,
     projectId: String(req.body.projectId || ''),
     phase: req.body.phase || 'construction',
     name: String(req.body.name || '未命名'),
     category: req.body.category || 'other',
-    fileData: '',
     fileType: String(req.body.fileType || 'application/octet-stream'),
     fileSize: Number(req.body.fileSize) || 0,
-    filePath: filePath ? `files/${docId}${mimeToExt(req.body.fileType) || '.bin'}` : '',
+    filePath: filePath || '',
+    fileData: fileDataBuffer || null,
     tags: Array.isArray(req.body.tags) ? req.body.tags : [],
     description: String(req.body.description || ''),
     deleted: false,
     uploadedAt: new Date().toISOString(),
   };
-  db.documents.push(doc);
-  saveDB();
-  res.status(201).json({ ...doc, filePath: doc.filePath });
+  createDocument(doc);
+  res.status(201).json({ ...doc, fileData: undefined, filePath: doc.filePath });
 });
 
 app.put('/api/documents/:id/soft-delete', requireAuth, (req, res) => {
-  const doc = db.documents.find((d) => d.id === req.params.id);
+  const doc = getDocumentById(req.params.id);
   if (!doc) return res.status(404).json({ message: '文档未找到' });
-  doc.deleted = true;
-  doc.deletedAt = new Date().toISOString();
-  saveDB();
+  softDeleteDocument(req.params.id);
   res.json({ success: true });
 });
 
 app.put('/api/documents/:id/restore', requireAuth, (req, res) => {
-  const doc = db.documents.find((d) => d.id === req.params.id);
+  const doc = getDocumentById(req.params.id);
   if (!doc) return res.status(404).json({ message: '文档未找到' });
-  doc.deleted = false;
-  delete doc.deletedAt;
-  saveDB();
+  restoreDocument(req.params.id);
   res.json({ success: true });
 });
 
 app.delete('/api/documents/:id', requireAuth, (req, res) => {
-  const idx = db.documents.findIndex((d) => d.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ message: '文档未找到' });
-  const doc = db.documents[idx];
+  const doc = getDocumentById(req.params.id);
+  if (!doc) return res.status(404).json({ message: '文档未找到' });
   if (doc.filePath) {
     const fp = path.join(DATA_DIR, doc.filePath);
     try { if (fs.existsSync(fp)) fs.unlinkSync(fp); } catch (e) { /* ignore */ }
   }
-  db.documents.splice(idx, 1);
-  saveDB();
+  permanentDeleteDocument(req.params.id);
   res.json({ success: true });
 });
 
 app.get('/api/documents/deleted', requireAuth, (_req, res) => {
-  res.json(db.documents.filter((d) => d.deleted));
+  res.json(getDeletedDocuments());
 });
 
 app.post('/api/documents/empty-trash', requireAuth, (_req, res) => {
-  const deletedDocs = db.documents.filter((d) => d.deleted);
+  const deletedDocs = getDeletedDocuments();
   for (const doc of deletedDocs) {
     if (doc.filePath) {
       const fp = path.join(DATA_DIR, doc.filePath);
       try { if (fs.existsSync(fp)) fs.unlinkSync(fp); } catch (e) { /* ignore */ }
     }
   }
-  db.documents = db.documents.filter((d) => !d.deleted);
-  saveDB();
+  emptyTrash();
   res.json({ success: true });
 });
 
-// ========== File Download ==========
+app.get('/api/documents/search', requireAuth, (req, res) => {
+  const { keyword } = req.query;
+  if (!keyword) return res.json([]);
+  res.json(searchDocuments(String(keyword)));
+});
+
+// ========== File Download / View ==========
 
 app.get('/api/files/download/:docId', requireAuth, (req, res) => {
-  const doc = db.documents.find((d) => d.id === req.params.docId);
-  if (!doc || !doc.filePath) return res.status(404).json({ message: '文件未找到' });
-  const fp = path.join(DATA_DIR, doc.filePath);
-  if (!fs.existsSync(fp)) return res.status(404).json({ message: '文件不存在' });
-  res.download(fp, doc.name + path.extname(doc.filePath));
+  const doc = getDocumentById(req.params.docId);
+  if (!doc) return res.status(404).json({ message: '文件未找到' });
+  // 优先从文件系统读取，回退到数据库 BLOB
+  if (doc.filePath) {
+    const fp = path.join(DATA_DIR, doc.filePath);
+    if (fs.existsSync(fp)) {
+      return res.download(fp, doc.name + path.extname(doc.filePath));
+    }
+  }
+  const fullDoc = getDocumentWithFileData(req.params.docId);
+  if (fullDoc && fullDoc.fileData) {
+    const buf = fullDoc.fileData instanceof Uint8Array ? Buffer.from(fullDoc.fileData) : Buffer.from(fullDoc.fileData, 'base64');
+    const ext = path.extname(doc.name) || mimeToExt(doc.fileType) || '.bin';
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(doc.name)}"`);
+    res.setHeader('Content-Type', doc.fileType || 'application/octet-stream');
+    return res.send(buf);
+  }
+  res.status(404).json({ message: '文件不存在' });
 });
 
 app.get('/api/files/view/:docId', requireAuth, (req, res) => {
-  const doc = db.documents.find((d) => d.id === req.params.docId);
-  if (!doc || !doc.filePath) return res.status(404).json({ message: '文件未找到' });
-  const fp = path.join(DATA_DIR, doc.filePath);
-  if (!fs.existsSync(fp)) return res.status(404).json({ message: '文件不存在' });
-  res.contentType(doc.fileType || 'application/octet-stream');
-  fs.createReadStream(fp).pipe(res);
+  const doc = getDocumentById(req.params.docId);
+  if (!doc) return res.status(404).json({ message: '文件未找到' });
+  if (doc.filePath) {
+    const fp = path.join(DATA_DIR, doc.filePath);
+    if (fs.existsSync(fp)) {
+      res.contentType(doc.fileType || 'application/octet-stream');
+      return fs.createReadStream(fp).pipe(res);
+    }
+  }
+  const fullDoc = getDocumentWithFileData(req.params.docId);
+  if (fullDoc && fullDoc.fileData) {
+    const buf = fullDoc.fileData instanceof Uint8Array ? Buffer.from(fullDoc.fileData) : Buffer.from(fullDoc.fileData, 'base64');
+    res.contentType(doc.fileType || 'application/octet-stream');
+    return res.send(buf);
+  }
+  res.status(404).json({ message: '文件不存在' });
 });
 
 app.get('/api/files/preview-docx/:docId', requireAuth, async (req, res) => {
   try {
-    const doc = db.documents.find((d) => d.id === req.params.docId);
-    if (!doc || !doc.filePath) return res.status(404).json({ message: '文件未找到' });
-    const fp = path.join(DATA_DIR, doc.filePath);
-    if (!fs.existsSync(fp)) return res.status(404).json({ message: '文件不存在' });
+    const doc = getDocumentById(req.params.docId);
+    if (!doc) return res.status(404).json({ message: '文件未找到' });
+
+    let fp = null;
+    if (doc.filePath) {
+      fp = path.join(DATA_DIR, doc.filePath);
+      if (!fs.existsSync(fp)) fp = null;
+    }
+    // 如果文件系统没有，从数据库提取到临时文件
+    if (!fp) {
+      const fullDoc = getDocumentWithFileData(req.params.docId);
+      if (fullDoc && fullDoc.fileData) {
+        const buf = fullDoc.fileData instanceof Uint8Array ? Buffer.from(fullDoc.fileData) : Buffer.from(fullDoc.fileData, 'base64');
+        const ext = mimeToExt(doc.fileType) || '.docx';
+        fp = path.join(FILES_DIR, `_tmp_${req.params.docId}${ext}`);
+        fs.writeFileSync(fp, buf);
+      }
+    }
+    if (!fp || !fs.existsSync(fp)) return res.status(404).json({ message: '文件不存在' });
 
     const mammoth = await import('mammoth');
     const result = await mammoth.default.convertToHtml({ path: fp });
@@ -490,27 +424,12 @@ app.get('/api/files/preview-docx/:docId', requireAuth, async (req, res) => {
   }
 });
 
-app.get('/api/documents/search', requireAuth, (req, res) => {
-  const { keyword } = req.query;
-  if (!keyword) return res.json([]);
-  const lower = String(keyword).toLowerCase();
-  res.json(db.documents.filter((d) =>
-    !d.deleted &&
-    (d.name.toLowerCase().includes(lower) ||
-     d.description.toLowerCase().includes(lower) ||
-     (d.tags || []).some((t) => t.toLowerCase().includes(lower)))
-  ));
-});
-
 // ========== Tasks API ==========
 
 const TASK_FIELDS = ['projectId', 'title', 'description', 'status', 'priority', 'assignee', 'dueDate'];
 
 app.get('/api/tasks', requireAuth, (req, res) => {
-  const { projectId } = req.query;
-  let tasks = db.tasks;
-  if (projectId) tasks = tasks.filter((t) => t.projectId === projectId || t.projectId === '');
-  res.json(tasks);
+  res.json(getTasks(req.query.projectId || undefined));
 });
 
 app.post('/api/tasks', requireAuth, (req, res) => {
@@ -520,62 +439,68 @@ app.post('/api/tasks', requireAuth, (req, res) => {
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
-  db.tasks.push(task);
-  saveDB();
+  createTask(task);
   res.status(201).json(task);
 });
 
 app.put('/api/tasks/:id', requireAuth, (req, res) => {
-  const idx = db.tasks.findIndex((t) => t.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ message: '任务未找到' });
-  db.tasks[idx] = { ...db.tasks[idx], ...pick(req.body, TASK_FIELDS), id: req.params.id, updatedAt: new Date().toISOString() };
-  if (req.body.status === 'completed') {
-    db.tasks[idx].completedAt = new Date().toISOString();
-  }
-  saveDB();
-  res.json(db.tasks[idx]);
+  const t = getTaskById(req.params.id);
+  if (!t) return res.status(404).json({ message: '任务未找到' });
+  const updates = { ...pick(req.body, TASK_FIELDS), updatedAt: new Date().toISOString() };
+  if (req.body.status === 'completed') updates.completedAt = new Date().toISOString();
+  updateTask(req.params.id, updates);
+  res.json({ ...t, ...updates });
 });
 
 app.delete('/api/tasks/:id', requireAuth, (req, res) => {
-  const idx = db.tasks.findIndex((t) => t.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ message: '任务未找到' });
-  db.tasks.splice(idx, 1);
-  saveDB();
+  const t = getTaskById(req.params.id);
+  if (!t) return res.status(404).json({ message: '任务未找到' });
+  deleteTask(req.params.id);
   res.json({ success: true });
 });
 
 // ========== Stats ==========
 
 app.get('/api/stats', requireAuth, (_req, res) => {
+  const projects = getProjects();
+  const docs = getDocuments();
+  const tasks = getTasks();
   const phaseDistribution = {};
-  for (const p of db.projects) {
+  for (const p of projects) {
     phaseDistribution[p.currentPhase] = (phaseDistribution[p.currentPhase] || 0) + 1;
   }
   res.json({
-    totalProjects: db.projects.length,
-    activeProjects: db.projects.filter((p) => p.status === 'in_progress').length,
-    totalDocuments: db.documents.filter((d) => !d.deleted).length,
-    pendingTasks: db.tasks.filter((t) => t.status !== 'completed').length,
+    totalProjects: projects.length,
+    activeProjects: projects.filter((p) => p.status === 'in_progress').length,
+    totalDocuments: docs.length,
+    pendingTasks: tasks.filter((t) => t.status !== 'completed').length,
     phaseDistribution,
   });
 });
 
-// ========== Data Export ==========
-
 app.get('/api/data/export', requireAuth, (_req, res) => {
+  const data = {
+    projects: getProjects(),
+    documents: getDocuments(),
+    tasks: getTasks(),
+    members: getMembers(),
+    admins: getAdmins(),
+  };
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Content-Disposition', `attachment; filename="backup-${new Date().toISOString().slice(0, 10)}.json"`);
-  res.json(db);
+  res.json(data);
 });
 
 app.get('/api/data/summary', requireAuth, (_req, res) => {
+  const stats = getDashboardStats();
+  const deletedDocs = getDeletedDocuments();
   res.json({
-    projects: db.projects.length,
-    documents: db.documents.filter((d) => !d.deleted).length,
-    deletedDocs: db.documents.filter((d) => d.deleted).length,
-    tasks: db.tasks.length,
-    pendingTasks: db.tasks.filter((t) => t.status !== 'completed').length,
-    dbSize: JSON.stringify(db).length,
+    projects: stats.totalProjects,
+    documents: stats.totalDocuments,
+    deletedDocs: deletedDocs.length,
+    tasks: stats.pendingTasks + stats.completedTasks,
+    pendingTasks: stats.pendingTasks,
+    dbSize: 0,
   });
 });
 
@@ -596,7 +521,7 @@ app.post('/api/data/open-folder', requireAuth, (_req, res) => {
 const MEMBER_FIELDS = ['name', 'role', 'phone', 'email', 'department', 'notes'];
 
 app.get('/api/members', requireAuth, (_req, res) => {
-  res.json(db.members || []);
+  res.json(getMembers());
 });
 
 app.post('/api/members', requireAuth, (req, res) => {
@@ -605,30 +530,21 @@ app.post('/api/members', requireAuth, (req, res) => {
     id: crypto.randomUUID(),
     createdAt: new Date().toISOString(),
   };
-  if (!db.members) db.members = [];
-  db.members.push(member);
-  saveDB();
+  createMember(member);
   res.status(201).json(member);
 });
 
 app.put('/api/members/:id', requireAuth, (req, res) => {
-  if (!db.members) db.members = [];
-  const idx = db.members.findIndex((m) => m.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ message: '成员未找到' });
-  db.members[idx] = { ...db.members[idx], ...pick(req.body, MEMBER_FIELDS), id: req.params.id };
-  saveDB();
-  res.json(db.members[idx]);
+  const m = getMemberById(req.params.id);
+  if (!m) return res.status(404).json({ message: '成员未找到' });
+  updateMember(req.params.id, pick(req.body, MEMBER_FIELDS));
+  res.json({ ...m, ...pick(req.body, MEMBER_FIELDS) });
 });
 
 app.delete('/api/members/:id', requireAuth, (req, res) => {
-  if (!db.members) db.members = [];
-  const idx = db.members.findIndex((m) => m.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ message: '成员未找到' });
-  db.members.splice(idx, 1);
-  for (const p of db.projects) {
-    if (p.memberIds) p.memberIds = p.memberIds.filter((mid) => mid !== req.params.id);
-  }
-  saveDB();
+  const m = getMemberById(req.params.id);
+  if (!m) return res.status(404).json({ message: '成员未找到' });
+  deleteMember(req.params.id);
   res.json({ success: true });
 });
 
@@ -681,9 +597,10 @@ app.get('/api/ai/search', requireAuth, checkAIRate, async (req, res) => {
   try {
     const { q } = req.query;
     if (!q) return res.json([]);
-    const activeDocs = db.documents.filter((d) => !d.deleted);
+    const activeDocs = getDocuments();
+    const projects = getProjects();
     const docSummaries = activeDocs.map((d) => {
-      const project = db.projects.find((p) => p.id === d.projectId);
+      const project = projects.find((p) => p.id === d.projectId);
       return `[${d.id}] ${d.name} | 项目:${project?.name || '未知'} | 阶段:${d.phase} | 描述:${d.description}`;
     }).join('\n');
     const messages = [
@@ -714,78 +631,79 @@ app.post('/api/ai/analyze-doc', requireAuth, checkAIRate, async (req, res) => {
   }
 });
 
-// ========== OCR 文字识别 ==========
+// ========== OCR ==========
 
 const SCRIPTS_DIR = path.join(__dirname, 'scripts');
 
 function runPythonScript(scriptName, ...args) {
   return new Promise((resolve, reject) => {
-    const { spawn } = require('child_process');
     const pyExe = process.platform === 'win32' ? 'python' : 'python3';
     const proc = spawn(pyExe, [path.join(SCRIPTS_DIR, scriptName), ...args], {
-      maxBuffer: 50 * 1024 * 1024, // 50MB buffer
+      maxBuffer: 50 * 1024 * 1024,
     });
     let stdout = '', stderr = '';
     proc.stdout.on('data', (d) => { stdout += d.toString(); });
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
     proc.on('close', (code) => {
       if (code !== 0) return reject(new Error(stderr || 'OCR 执行失败'));
-      try {
-        resolve(JSON.parse(stdout));
-      } catch {
-        reject(new Error('OCR 结果解析失败'));
-      }
+      try { resolve(JSON.parse(stdout)); }
+      catch { reject(new Error('OCR 结果解析失败')); }
     });
     proc.on('error', (err) => reject(err));
   });
 }
 
-// OCR 识别接口
 app.post('/api/ocr/recognize', requireAuth, async (req, res) => {
   try {
-    const { filePath } = req.body;
-    if (!filePath) return res.status(400).json({ message: '请提供文件路径' });
+    const { docId } = req.body;
+    if (!docId) return res.status(400).json({ message: '请提供文件ID' });
 
-    const fullPath = path.join(FILES_DIR, path.basename(filePath));
-    if (!fs.existsSync(fullPath)) return res.status(404).json({ message: '文件不存在' });
+    const doc = getDocumentById(docId);
+    if (!doc) return res.status(404).json({ message: '文件未找到' });
 
-    const result = await runPythonScript('ocr.py', fullPath, '--lang', 'ch');
+    let fp = null;
+    if (doc.filePath) {
+      fp = path.join(DATA_DIR, doc.filePath);
+      if (!fs.existsSync(fp)) fp = null;
+    }
+    if (!fp) {
+      const fullDoc = getDocumentWithFileData(docId);
+      if (fullDoc && fullDoc.fileData) {
+        const buf = fullDoc.fileData instanceof Uint8Array ? Buffer.from(fullDoc.fileData) : Buffer.from(fullDoc.fileData, 'base64');
+        const ext = path.extname(doc.name) || mimeToExt(doc.fileType) || '.png';
+        fp = path.join(FILES_DIR, `_ocr_${docId}${ext}`);
+        fs.writeFileSync(fp, buf);
+      }
+    }
+    if (!fp || !fs.existsSync(fp)) return res.status(404).json({ message: '文件不存在' });
+
+    const result = await runPythonScript('ocr.py', fp, '--lang', 'ch');
     res.json(result);
   } catch (e) {
     safeError(res, e, 'OCR 识别失败');
   }
 });
 
-// AI 信息提取接口
 app.post('/api/ocr/extract', requireAuth, checkAIRate, async (req, res) => {
   try {
     const { text, prompt } = req.body;
     if (!text) return res.status(400).json({ message: '请提供待提取的文本' });
-
-    const userPrompt = prompt || '请提取以下文本中的工程关键信息（项目名称、工程部位、材料规格、强度等级、施工日期等），以 JSON 格式返回，字段名用英文。';
-
+    const userPrompt = prompt || '请提取以下文本中的工程关键信息，以 JSON 格式返回，字段名用英文。';
     const messages = [
       { role: 'system', content: '你是一个专业的工程资料结构化提取助手。请严格按照用户要求的格式提取信息，只返回提取结果，不要添加额外说明。' },
       { role: 'user', content: `${userPrompt}\n\n待提取文本：\n${text.slice(0, 15000)}` },
     ];
-
     const aiRes = await callDeepSeek(messages);
     const data = await aiRes.json();
     const content = data.choices[0].message.content;
-
-    // 尝试解析 JSON
     let extracted = null;
     const jsonMatch = content.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
     if (jsonMatch) {
-      try {
-        extracted = JSON.parse(jsonMatch[0]);
-      } catch {
-        extracted = { raw: content };
-      }
+      try { extracted = JSON.parse(jsonMatch[0]); }
+      catch { extracted = { raw: content }; }
     } else {
       extracted = { raw: content };
     }
-
     res.json({ success: true, extracted, rawContent: content });
   } catch (e) {
     safeError(res, e, 'AI 提取失败');
@@ -802,8 +720,7 @@ app.post('/api/files/classify', requireAuth, checkAIRate, async (req, res) => {
     const phasesCN = { initiation: '立项阶段', design: '设计阶段', bidding: '招标阶段', construction: '施工阶段', acceptance: '验收阶段', operation: '运维阶段' };
     let filesInfo = '';
     for (let i = 0; i < files.length; i++) {
-      const f = files[i];
-      filesInfo += `文件${i + 1}:\n名称:${f.name}\n类型:${f.fileType || '未知'}\n内容:${String(f.textContent || '').slice(0, 2000)}\n\n`;
+      filesInfo += `文件${i+1}:\n名称:${files[i].name}\n类型:${files[i].fileType||'未知'}\n内容:${String(files[i].textContent||'').slice(0,2000)}\n\n`;
     }
     const prompt = `你是工程文件归档专家。对以下文件分类并返回JSON数组:\n[{"index":1,"category":"contract","phase":"bidding","suggestedName":"标准化名","summary":"摘要"}]\n分类:drawing/contract/report/approval/plan/acceptance_doc/other\n阶段:initiation/design/bidding/construction/acceptance/operation\n\n${filesInfo}只返回JSON数组。`;
     const aiRes = await callDeepSeek([{ role: 'user', content: prompt }]);
@@ -811,29 +728,28 @@ app.post('/api/files/classify', requireAuth, checkAIRate, async (req, res) => {
     const match = data.choices[0].message.content.match(/\[[\s\S]*\]/);
     const results = match ? JSON.parse(match[0]) : [];
     const classified = files.map((f, i) => {
-      const r = results.find((r) => r.index === i + 1);
+      const r = results.find((r) => r.index === i+1);
       return {
         name: f.name, size: f.size,
-        category: r?.category || 'other', categoryLabel: categoriesCN[r?.category] || '其他',
-        phase: r?.phase || 'construction', phaseLabel: phasesCN[r?.phase] || '施工阶段',
-        suggestedName: r?.suggestedName || '', summary: r?.summary || '',
+        category: r?.category||'other', categoryLabel: categoriesCN[r?.category]||'其他',
+        phase: r?.phase||'construction', phaseLabel: phasesCN[r?.phase]||'施工阶段',
+        suggestedName: r?.suggestedName||'', summary: r?.summary||'',
       };
     });
     res.json(classified);
   } catch (e) {
     console.error('AI classify error:', e.message);
-    // Fallback: keyword matching
     const results = (req.body.files || []).map((f) => {
       const combined = (f.name + ' ' + (f.textContent || '')).toLowerCase();
       let cat = 'other', ph = 'construction';
-      if (/图|设计图|施工图|cad|dwg/.test(combined)) { cat = 'drawing'; ph = 'design'; }
-      else if (/合同|协议|招标|投标/.test(combined)) { cat = 'contract'; ph = 'bidding'; }
-      else if (/报告|检测|评估|鉴定/.test(combined)) { cat = 'report'; ph = 'acceptance'; }
-      else if (/审批|报审|申请/.test(combined)) { cat = 'approval'; ph = 'bidding'; }
-      else if (/方案|施工组织|计划/.test(combined)) { cat = 'plan'; ph = 'construction'; }
-      else if (/验收|竣工|交付/.test(combined)) { cat = 'acceptance_doc'; ph = 'acceptance'; }
-      else if (/开工|规划|可研/.test(combined)) { cat = 'plan'; ph = 'initiation'; }
-      return { name: f.name, size: f.size, category: cat, categoryLabel: '其他', phase: ph, phaseLabel: '施工阶段', suggestedName: '', summary: '' };
+      if (/图|设计图|施工图|cad|dwg/.test(combined)) { cat='drawing'; ph='design'; }
+      else if (/合同|协议|招标|投标/.test(combined)) { cat='contract'; ph='bidding'; }
+      else if (/报告|检测|评估|鉴定/.test(combined)) { cat='report'; ph='acceptance'; }
+      else if (/审批|报审|申请/.test(combined)) { cat='approval'; ph='bidding'; }
+      else if (/方案|施工组织|计划/.test(combined)) { cat='plan'; ph='construction'; }
+      else if (/验收|竣工|交付/.test(combined)) { cat='acceptance_doc'; ph='acceptance'; }
+      else if (/开工|规划|可研/.test(combined)) { cat='plan'; ph='initiation'; }
+      return { name:f.name, size:f.size, category:cat, categoryLabel:'其他', phase:ph, phaseLabel:'施工阶段', suggestedName:'', summary:'' };
     });
     res.json(results);
   }
@@ -848,27 +764,29 @@ app.post('/api/files/batch-upload', requireAuth, (req, res) => {
     for (const file of files) {
       const docId = crypto.randomUUID();
       let filePath = '';
+      let fileDataBuffer = null;
       if (file.fileData) {
         const safeExt = mimeToExt(file.fileType) || '.bin';
-        filePath = path.join(FILES_DIR, `${docId}${safeExt}`);
-        fs.writeFileSync(filePath, Buffer.from(file.fileData, 'base64'));
+        filePath = `files/${docId}${safeExt}`;
+        const fullPath = path.join(FILES_DIR, `${docId}${safeExt}`);
+        fileDataBuffer = Buffer.from(file.fileData, 'base64');
+        fs.writeFileSync(fullPath, fileDataBuffer);
       }
       const doc = {
         id: docId, projectId: String(projectId),
         name: String(file.name || '未命名'),
         phase: file.phase || 'construction', category: file.category || 'other',
-        fileData: '', fileType: String(file.fileType || 'application/octet-stream'),
+        fileType: String(file.fileType || 'application/octet-stream'),
         fileSize: Number(file.size) || 0,
-        filePath: filePath ? `files/${docId}${mimeToExt(file.fileType) || '.bin'}` : '',
+        filePath, fileData: fileDataBuffer,
         tags: Array.isArray(file.tags) ? file.tags : [],
         description: String(file.description || ''),
         deleted: false, uploadedAt: new Date().toISOString(),
       };
-      db.documents.push(doc);
-      saved.push(doc);
+      createDocument(doc);
+      saved.push({ id: doc.id, name: doc.name, phase: doc.phase, category: doc.category });
     }
-    saveDB();
-    res.json({ success: true, count: saved.length, documents: saved.map((d) => ({ id: d.id, name: d.name, phase: d.phase, category: d.category })) });
+    res.json({ success: true, count: saved.length, documents: saved });
   } catch (e) {
     safeError(res, e, '文件上传失败');
   }
@@ -877,8 +795,9 @@ app.post('/api/files/batch-upload', requireAuth, (req, res) => {
 // ========== Public ==========
 
 app.get('/api/sync-time', (_req, res) => {
+  const dbFile = path.join(DATA_DIR, 'app.db');
   try {
-    const stat = fs.statSync(DB_FILE);
+    const stat = fs.statSync(dbFile);
     res.json({ lastSaved: stat.mtime.toISOString() });
   } catch {
     res.json({ lastSaved: new Date().toISOString() });
@@ -897,6 +816,7 @@ app.get('/api/system/memory', (_req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running at http://localhost:${PORT}`);
-  console.log(`Data stored in: ${DB_FILE}`);
+  console.log(`SQLite database: ${path.join(DATA_DIR, 'app.db')}`);
+  console.log(`Files: ${FILES_DIR}`);
   console.log(`Backups: ${BACKUP_DIR}`);
 });

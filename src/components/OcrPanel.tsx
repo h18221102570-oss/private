@@ -45,7 +45,7 @@ export default function OcrPanel() {
       const res = await fetch('/api/ocr/recognize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
-        body: JSON.stringify({ filePath: selectedDoc.filePath || '' }),
+        body: JSON.stringify({ docId: selectedDoc.id }),
       })
       const data = await res.json()
       if (!res.ok || !data.success) throw new Error(data.error || data.message || '识别失败')
